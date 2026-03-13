@@ -1,10 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
 import { z } from "zod"
 import { readFileSync, writeFileSync, existsSync } from "fs"
 import { join } from "path"
 import dotenv from "dotenv"
+import express, { Request, Response, NextFunction } from "express"
+import { randomUUID } from "crypto"
 import { tokenManager } from "./token-manager.js"
+import { saveList, getAllLists, updateList, removeList, mergeLists } from "./list-registry.js"
 
 // Load environment variables
 dotenv.config()
@@ -101,6 +104,21 @@ but API access is restricted for personal accounts.
     console.error("Error making Graph API request:", error)
     return null
   }
+}
+
+// Paginated helper that follows @odata.nextLink until all pages are fetched
+async function makePagedGraphRequest<T>(url: string, token: string): Promise<T[]> {
+  const results: T[] = []
+  let nextUrl: string | undefined = url
+
+  while (nextUrl) {
+    const data: { value: T[]; "@odata.nextLink"?: string } | null = await makeGraphRequest<{ value: T[]; "@odata.nextLink"?: string }>(nextUrl, token)
+    if (!data) break
+    results.push(...(data.value || []))
+    nextUrl = data["@odata.nextLink"]
+  }
+
+  return results
 }
 
 // Authentication helper using delegated flow with token manager
@@ -300,20 +318,10 @@ server.tool(
         }
       }
 
-      const response = await makeGraphRequest<{ value: TaskList[] }>(`${MS_GRAPH_BASE}/me/todo/lists`, token)
+      // Fetch from API (returns well-known lists) and merge with local registry
+      const apiLists = await makePagedGraphRequest<TaskList>(`${MS_GRAPH_BASE}/me/todo/lists`, token)
+      const lists = mergeLists(apiLists)
 
-      if (!response) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to retrieve task lists",
-            },
-          ],
-        }
-      }
-
-      const lists = response.value || []
       if (lists.length === 0) {
         return {
           content: [
@@ -391,20 +399,10 @@ server.tool(
         }
       }
 
-      const response = await makeGraphRequest<{ value: TaskList[] }>(`${MS_GRAPH_BASE}/me/todo/lists`, token)
+      // Fetch from API (returns well-known lists) and merge with local registry
+      const apiLists = await makePagedGraphRequest<TaskList>(`${MS_GRAPH_BASE}/me/todo/lists`, token)
+      const lists = mergeLists(apiLists)
 
-      if (!response) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to retrieve task lists",
-            },
-          ],
-        }
-      }
-
-      const lists = response.value || []
       if (lists.length === 0) {
         return {
           content: [
@@ -673,6 +671,15 @@ server.tool(
         }
       }
 
+      // Persist to local registry so get-task-lists can find it
+      saveList({
+        id: response.id,
+        displayName: response.displayName,
+        wellknownListName: response.wellknownListName,
+        isOwner: response.isOwner,
+        isShared: response.isShared,
+      })
+
       return {
         content: [
           {
@@ -739,6 +746,9 @@ server.tool(
         }
       }
 
+      // Keep registry in sync
+      updateList(listId, response.displayName)
+
       return {
         content: [
           {
@@ -786,6 +796,9 @@ server.tool(
 
       // The DELETE method doesn't return a response body, so we expect null
       await makeGraphRequest<null>(url, token, "DELETE")
+
+      // Remove from local registry
+      removeList(listId)
 
       // If we get here, the delete was successful (204 No Content)
       return {
@@ -1915,17 +1928,101 @@ server.tool(
 // Main function to start the server
 export async function startServer(config?: ServerConfig): Promise<void> {
   try {
-    // Note: Token management is now handled by the TokenManager class
-    // Config options are kept for backward compatibility but not used
-
     // Check if using a personal Microsoft account and show warning if needed
     await isPersonalMicrosoftAccount()
 
-    // Start the server
-    const transport = new StdioServerTransport()
-    await server.connect(transport)
+    const app = express()
+    app.use(express.json())
 
-    console.error("Server started and listening")
+    // API key auth middleware — set MCP_API_KEY env var to enable
+    const apiKey = process.env.MCP_API_KEY
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (!apiKey) return next() // no key set = open (local dev)
+      // Skip auth for health check
+      if (req.path === "/health") return next()
+      const auth = req.headers.authorization
+      if (!auth || auth !== `Bearer ${apiKey}`) {
+        res.status(401).json({ error: "Unauthorized" })
+        return
+      }
+      next()
+    })
+
+    // Health check
+    app.get("/health", (_req: Request, res: Response) => {
+      res.json({ status: "ok", server: "microsoft-todo-mcp" })
+    })
+
+    // Session store — one transport per connected client
+    const sessions = new Map<string, StreamableHTTPServerTransport>()
+    // Mutex to prevent concurrent new-session races
+    let connecting = false
+
+    app.post("/mcp", async (req: Request, res: Response) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined
+
+      if (sessionId && sessions.has(sessionId)) {
+        // Existing session — reuse transport
+        await sessions.get(sessionId)!.handleRequest(req, res, req.body)
+        return
+      }
+
+      // Reject concurrent new-session attempts
+      if (connecting) {
+        res.status(503).json({ error: "Server is connecting. Retry shortly." })
+        return
+      }
+
+      connecting = true
+      try {
+        // Close any existing session before accepting a new one
+        if (sessions.size > 0) {
+          try { await server.close() } catch {}
+          sessions.clear()
+        }
+
+        const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id: string): void => { sessions.set(id, transport) },
+        })
+        transport.onclose = () => {
+          if (transport.sessionId) sessions.delete(transport.sessionId)
+        }
+        await server.connect(transport)
+        await transport.handleRequest(req, res, req.body)
+      } finally {
+        connecting = false
+      }
+    })
+
+    app.get("/mcp", async (req: Request, res: Response) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({ error: "Invalid or missing session ID" })
+        return
+      }
+      await sessions.get(sessionId)!.handleRequest(req, res)
+    })
+
+    app.delete("/mcp", async (req: Request, res: Response) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined
+      if (sessionId && sessions.has(sessionId)) {
+        await sessions.get(sessionId)!.close()
+        sessions.delete(sessionId)
+      }
+      res.status(200).end()
+    })
+
+    const port = parseInt(process.env.PORT ?? "3001", 10)
+    app.listen(port, () => {
+      console.error(`Microsoft To Do MCP server listening on port ${port}`)
+      console.error(`MCP endpoint: http://localhost:${port}/mcp`)
+      if (apiKey) {
+        console.error("API key auth: enabled")
+      } else {
+        console.error("API key auth: disabled (set MCP_API_KEY to enable)")
+      }
+    })
   } catch (error) {
     console.error("Error starting server:", error)
     throw error

@@ -22,6 +22,11 @@ dist/
 # Tokens file (contains sensitive authentication data)
 tokens.json
 
+# Local list registry database
+lists.db
+
+mcp.json
+
 # Editor directories and files
 .idea/
 .vscode/

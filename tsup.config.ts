@@ -7,7 +7,8 @@ export default defineConfig({
     'src/create-mcp-config.ts',
     'src/auth-server.ts',
     'src/setup.ts',
-    'src/token-manager.ts'
+    'src/token-manager.ts',
+    'src/list-registry.ts'
   ],
   outDir: 'dist',
   format: ['esm'],
