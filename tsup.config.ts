@@ -1,4 +1,5 @@
 import { defineConfig } from 'tsup'
+import { copyFileSync } from 'fs'
 
 export default defineConfig({
   entry: [
@@ -8,7 +9,8 @@ export default defineConfig({
     'src/auth-server.ts',
     'src/setup.ts',
     'src/token-manager.ts',
-    'src/list-registry.ts'
+    'src/list-registry.ts',
+    'src/dashboard.ts'
   ],
   outDir: 'dist',
   format: ['esm'],
@@ -21,5 +23,9 @@ export default defineConfig({
   external: ['dotenv'],
   esbuildOptions(options) {
     options.platform = 'node'
+  },
+  async onSuccess() {
+    copyFileSync('src/dashboard.html', 'dist/dashboard.html')
+    console.log('Copied dashboard.html to dist/')
   }
 })

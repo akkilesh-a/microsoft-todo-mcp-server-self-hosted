@@ -6,8 +6,10 @@ import { join } from "path"
 import dotenv from "dotenv"
 import express, { Request, Response, NextFunction } from "express"
 import { randomUUID } from "crypto"
+import { ConfidentialClientApplication, Configuration, LogLevel } from "@azure/msal-node"
 import { tokenManager } from "./token-manager.js"
 import { saveList, getAllLists, updateList, removeList, mergeLists } from "./list-registry.js"
+import { renderDashboard } from "./dashboard.js"
 
 // Load environment variables
 dotenv.config()
@@ -1938,8 +1940,11 @@ export async function startServer(config?: ServerConfig): Promise<void> {
     const apiKey = process.env.MCP_API_KEY
     app.use((req: Request, res: Response, next: NextFunction) => {
       if (!apiKey) return next() // no key set = open (local dev)
-      // Skip auth for health check
+      // Health check is always public
       if (req.path === "/health") return next()
+      // Dashboard & OAuth routes use separate DASHBOARD_PASSWORD basic auth (handled below)
+      const dashboardPaths = ["/", "/auth", "/callback"]
+      if (dashboardPaths.includes(req.path)) return next()
       const auth = req.headers.authorization
       if (!auth || auth !== `Bearer ${apiKey}`) {
         res.status(401).json({ error: "Unauthorized" })
@@ -1951,6 +1956,123 @@ export async function startServer(config?: ServerConfig): Promise<void> {
     // Health check
     app.get("/health", (_req: Request, res: Response) => {
       res.json({ status: "ok", server: "microsoft-todo-mcp" })
+    })
+
+    // ── Dashboard basic auth (optional — set DASHBOARD_PASSWORD to enable) ──
+    const dashboardPassword = process.env.DASHBOARD_PASSWORD
+    const dashboardUsername = process.env.DASHBOARD_USERNAME ?? "admin"
+    const dashboardPaths = ["/", "/auth", "/callback"]
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (!dashboardPassword) return next()
+      if (!dashboardPaths.includes(req.path)) return next()
+      const authHeader = req.headers.authorization ?? ""
+      const b64 = authHeader.startsWith("Basic ") ? authHeader.slice(6) : ""
+      const decoded = b64 ? Buffer.from(b64, "base64").toString() : ""
+      const [user, pass] = decoded.split(":")
+      if (user === dashboardUsername && pass === dashboardPassword) return next()
+      res.setHeader("WWW-Authenticate", 'Basic realm="MCP Dashboard"')
+      res.status(401).send("Unauthorized")
+    })
+
+    // ── OAuth / Dashboard ──────────────────────────────────────────────────
+
+    const publicUrl = process.env.PUBLIC_URL ?? `http://localhost:${parseInt(process.env.PORT ?? "3001", 10)}`
+    const tenantId = process.env.TENANT_ID ?? "consumers"
+    const redirectUri = process.env.REDIRECT_URI ?? `${publicUrl}/callback`
+
+    const msalScopes = [
+      "offline_access", "openid", "profile",
+      "Tasks.Read", "Tasks.Read.Shared",
+      "Tasks.ReadWrite", "Tasks.ReadWrite.Shared",
+      "User.Read",
+    ]
+
+    const msalConfig: Configuration = {
+      auth: {
+        clientId: process.env.CLIENT_ID!,
+        authority: `https://login.microsoftonline.com/${tenantId}`,
+        clientSecret: process.env.CLIENT_SECRET!,
+      },
+      system: {
+        loggerOptions: {
+          loggerCallback: (_level: LogLevel, message: string) => console.error(`MSAL: ${message}`),
+          piiLoggingEnabled: false,
+          logLevel: LogLevel.Warning,
+        },
+      },
+    }
+
+    const cca = new ConfidentialClientApplication(msalConfig)
+
+    // Dashboard
+    app.get("/", async (_req: Request, res: Response) => {
+      const tokens = await tokenManager.getTokens()
+      let userEmail: string | undefined
+      if (tokens) {
+        try {
+          const r = await fetch(`${MS_GRAPH_BASE}/me`, {
+            headers: { Authorization: `Bearer ${tokens.accessToken}` },
+          })
+          if (r.ok) {
+            const u = await r.json() as any
+            userEmail = u.mail ?? u.userPrincipalName
+          }
+        } catch {}
+      }
+      res.send(renderDashboard({
+        connected: !!tokens,
+        userEmail,
+        tokenExpiresAt: (tokens as any)?.expiresAt,
+        apiKey: process.env.MCP_API_KEY,
+        publicUrl,
+      }))
+    })
+
+    // Start OAuth flow
+    app.get("/auth", (_req: Request, res: Response) => {
+      cca.getAuthCodeUrl({ scopes: msalScopes, redirectUri, prompt: "consent", responseMode: "query" as any })
+        .then((url) => res.redirect(url))
+        .catch((err) => res.status(500).send(`Error generating auth URL: ${err.message}`))
+    })
+
+    // OAuth callback — save tokens
+    app.get("/callback", async (req: Request, res: Response) => {
+      try {
+        const response = await cca.acquireTokenByCode({
+          code: req.query.code as string,
+          scopes: msalScopes,
+          redirectUri,
+        })
+
+        // Extract refresh token from MSAL cache
+        const cacheJson = JSON.parse(await cca.getTokenCache().serialize())
+        let refreshToken = ""
+        for (const section of ["RefreshTokens", "RefreshToken"]) {
+          const obj = cacheJson[section]
+          if (obj && Object.keys(obj).length > 0) {
+            refreshToken = obj[Object.keys(obj)[0]].secret
+            break
+          }
+        }
+
+        const tokenPath = process.env.MSTODO_TOKEN_FILE ?? join(process.cwd(), "tokens.json")
+        const existing = existsSync(tokenPath) ? JSON.parse(readFileSync(tokenPath, "utf8")) : {}
+        writeFileSync(tokenPath, JSON.stringify({
+          ...existing,
+          accessToken: response.accessToken,
+          refreshToken,
+          expiresAt: Date.now() + ((response as any).expiresIn ?? 3600) * 1000 - 5 * 60 * 1000,
+          tokenType: response.tokenType,
+          scopes: response.scopes,
+          clientId: process.env.CLIENT_ID,
+          clientSecret: process.env.CLIENT_SECRET,
+          tenantId,
+        }, null, 2), "utf8")
+
+        res.redirect("/")
+      } catch (err: any) {
+        res.status(500).send(`Authentication failed: ${err.message}`)
+      }
     })
 
     // Session store — one transport per connected client
